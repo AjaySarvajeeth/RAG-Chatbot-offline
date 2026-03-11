@@ -1,0 +1,134 @@
+# app.py
+import os
+from pathlib import Path
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from local_llm import stream_llm
+from retriever import get_retriever
+
+# ---------------- CONFIG ---------------- #
+MAX_MEMORY_TURNS = 5
+INDEX_DIR = Path(os.getenv('INDEX_DIR', './index')).resolve()
+
+# ---------------- APP ---------------- #
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve static files (CSS, JS, images, etc.)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Setup templates folder
+templates = Jinja2Templates(directory="templates")
+
+# ---------------- MEMORY ---------------- #
+conversation_memory = []
+
+def add_to_memory(user_input, bot_output):
+    conversation_memory.append({"user": user_input, "bot": bot_output})
+    if len(conversation_memory) > MAX_MEMORY_TURNS:
+        conversation_memory.pop(0)
+
+def get_memory_text():
+    return "\n".join(f"User: {m['user']}\nBot: {m['bot']}" for m in conversation_memory)
+
+# ---------------- RETRIEVER ---------------- #
+retriever = get_retriever()
+
+def build_prompt(user_input):
+    # Retrieve top-k context chunks
+    context_chunks = retriever(user_input)
+    context_text = "\n".join(context_chunks)
+
+    # Strict factual prompt
+    prompt = f"""
+You are an expert IPC assistant. Answer based only on the documentation provided.
+If the answer is not explicitly in the documentation, give your best answer based on reasoning from the docs.
+Do not make up information unrelated to the documentation.
+
+Documentation:
+{context_text}
+
+Question:
+{user_input}
+
+Answer:
+"""
+    return prompt.strip()
+
+# ---------------- CHAT ENDPOINT ---------------- #
+@app.post("/chat")
+async def chat(request: Request):
+    """
+    Streaming chat endpoint with memory and new-topic handling.
+    """
+    form = await request.form()
+    user_input = form.get("query", "").strip()
+    new_topic = form.get("new_topic", "false").lower() == "true"
+
+    if not user_input:
+        return {"error": "Empty query"}
+
+    # Build prompt
+    context_chunks = retriever(user_input)
+    context_text = "\n".join(context_chunks)
+    memory_text = get_memory_text() if not new_topic else ""
+
+    prompt = f"""
+You are an expert IPC assistant. Only answer based on the documentation below.
+Do NOT invent answers. If the answer is not in the docs, reply "I don't know".
+Answer concisely in 2–3 bullet points or short sentences.
+Use conversation context only if this is a follow-up (new_topic=False).
+
+Context:
+{context_text}
+
+Conversation history:
+{memory_text}
+
+User: {user_input}
+Bot:
+""".strip()
+
+    # Streaming generator (normal loop)
+    def event_generator():
+        bot_text = ""
+        try:
+            for token in stream_llm(prompt):
+                bot_text += token
+                yield token
+            add_to_memory(user_input, bot_text, new_topic=new_topic)
+        except Exception as e:
+            yield f"\n[Error]: {e}"
+
+    return StreamingResponse(event_generator(), media_type="text/plain")
+
+# ---------------- TEMPLATE ROUTE ---------------- #
+@app.get("/chat-ui")
+async def chat_ui(request: Request):
+    return templates.TemplateResponse("chat.html", {"request": request})
+
+# ---------------- ROOT ---------------- #
+@app.get("/")
+async def root():
+    return {"message": "IPC Chatbot API running."}
+
+# ---------------- RUN ---------------- #
+if __name__ == "__main__":
+    import uvicorn
+    import webbrowser
+    import threading
+
+    def open_browser():
+        webbrowser.open("http://127.0.0.1:8000/static/chat.html")
+
+    threading.Timer(1.0, open_browser).start()
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
